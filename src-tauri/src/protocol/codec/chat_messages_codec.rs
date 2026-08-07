@@ -588,6 +588,20 @@ fn messages_request_system_text_and_sampling() {
 }
 
 #[test]
+fn messages_request_stream_options_are_allowed_and_force_usage() {
+    let body = json!({
+        "model": "m",
+        "stream": true,
+        "stream_options": {"include_usage": false, "custom": true},
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["stream_options"]["include_usage"], true);
+    assert_eq!(out["stream_options"]["custom"], true);
+}
+
+#[test]
 fn messages_request_tools_choice_and_tool_results() {
     let body = json!({
         "model": "m",
@@ -739,7 +753,7 @@ fn messages_request_assistant_thinking_becomes_reasoning_content() {
 fn messages_request_unknown_role_and_block_rejected() {
     let body = json!({
         "model": "m",
-        "messages": [{"role": "system", "content": "x"}]
+        "messages": [{"role": "bogus", "content": "x"}]
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
     assert!(reject_features(&e)
@@ -754,6 +768,29 @@ fn messages_request_unknown_role_and_block_rejected() {
     assert!(reject_features(&e)
         .iter()
         .any(|c| c.contains("unknown_block")));
+}
+
+#[test]
+fn messages_request_mid_conversation_system_maps_to_chat_system_role() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "activate strict mode"},
+            {"role": "system", "content": [{"type": "text", "text": "strict mode active", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": "ack"}
+        ]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let messages = prepared.encoded_request["messages"].as_array().unwrap();
+    assert_eq!(
+        messages[0],
+        json!({"role": "user", "content": "activate strict mode"})
+    );
+    assert_eq!(
+        messages[1],
+        json!({"role": "system", "content": "strict mode active"})
+    );
+    assert_eq!(messages[2], json!({"role": "assistant", "content": "ack"}));
 }
 
 #[test]

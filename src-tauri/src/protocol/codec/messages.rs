@@ -36,6 +36,7 @@ pub fn encode_messages_to_chat(
         "top_p",
         "stop_sequences",
         "stream",
+        "stream_options",
         "tools",
         "tool_choice",
         "system",
@@ -278,7 +279,7 @@ fn convert_anthropic_message_to_chat(
         )
     })?;
     match role {
-        "user" | "assistant" => {}
+        "user" | "assistant" | "system" => {}
         other => {
             return Err(UnsupportedFeatures::single(
                 FeatureKind::UnknownRole,
@@ -289,6 +290,19 @@ fn convert_anthropic_message_to_chat(
     }
 
     let content = msg.get("content");
+    if role == "system" {
+        let content = content.ok_or_else(|| {
+            UnsupportedFeatures::single(
+                FeatureKind::UnknownBlock,
+                format!("{pointer}/content"),
+                "system message missing content",
+            )
+        })?;
+        let text =
+            request::anthropic_system_to_chat(content, &format!("{pointer}/content"), normalized)?;
+        return Ok(vec![serde_json::json!({"role": "system", "content": text})]);
+    }
+
     let content_arr = content.and_then(Value::as_array);
     if let Some(items) = content_arr {
         let mut user_parts: Vec<Value> = Vec::new();

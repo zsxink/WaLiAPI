@@ -634,32 +634,11 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // Extract system message and prepend it
-    let system = body.get("system").map(|s| {
-        if let Some(str_val) = s.as_str() {
-            Ok(str_val.to_string())
-        } else if let Some(arr) = s.as_array() {
-            let mut texts = Vec::new();
-            for block in arr {
-                // Prompt caching changes Anthropic billing/cache behavior but
-                // not the text content of a Chat Completions request.  It is
-                // safe to drop this annotation on the OpenAI bridge; native
-                // channels still receive the original body unchanged.
-                match block.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => texts.push(block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                    Some("thinking") => {
-                        // Fail-open: reasoning instructions on the system prompt
-                        // are dropped (no Chat equivalent), not rejected.
-                    }
-                    Some("cache_control") => return Err("system cache_control blocks require a native Anthropic Messages channel".to_string()),
-                    _ => return Err("unsupported non-text system content requires a native Anthropic Messages channel".to_string()),
-                }
-            }
-            Ok(texts.join(""))
-        } else {
-            Err("system must be text or an array of text blocks".to_string())
-        }
-    }).transpose()?;
+    // Extract top-level system message and prepend it.
+    let system = body
+        .get("system")
+        .map(anthropic_system_content_to_openai_text)
+        .transpose()?;
 
     // Convert Anthropic message content (array format) to OpenAI string format
     let openai_messages = convert_anthropic_messages_to_openai(&messages, system)?;
@@ -767,7 +746,20 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             };
             openai_body["tool_choice"] = openai_tc;
         } else if let Some(s) = tc.as_str() {
-            openai_body["tool_choice"] = Value::String(s.to_string());
+            let openai_tc = match s {
+                "auto" => Value::String("auto".to_string()),
+                "any" => Value::String("required".to_string()),
+                "tool" => return Err("Anthropic tool_choice 'tool' requires a name".to_string()),
+                _ => {
+                    return Err(
+                        "unsupported Anthropic tool_choice requires a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+            };
+            openai_body["tool_choice"] = openai_tc;
+        } else {
+            return Err("unsupported Anthropic tool_choice requires a native Anthropic Messages channel".to_string());
         }
     }
 
@@ -860,6 +852,48 @@ fn tool_result_to_openai_content(block: &Value) -> Result<String, String> {
     }
 }
 
+fn anthropic_system_content_to_openai_text(value: &Value) -> Result<String, String> {
+    if let Some(str_val) = value.as_str() {
+        Ok(str_val.to_string())
+    } else if let Some(arr) = value.as_array() {
+        let mut texts = Vec::new();
+        for block in arr {
+            // Prompt caching changes Anthropic billing/cache behavior but not
+            // the text content of a Chat Completions request.  It is safe to
+            // drop this annotation on the OpenAI bridge; native channels still
+            // receive the original body unchanged.
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => texts.push(
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Some("thinking") => {
+                    // Fail-open: reasoning instructions on the system prompt
+                    // are dropped (no Chat equivalent), not rejected.
+                }
+                Some("cache_control") => {
+                    return Err(
+                        "system cache_control blocks require a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+                _ => {
+                    return Err(
+                        "unsupported non-text system content requires a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        Ok(texts.join(""))
+    } else {
+        Err("system must be text or an array of text blocks".to_string())
+    }
+}
+
 /// Convert Anthropic messages array to OpenAI messages array.
 /// Anthropic content can be string or array of content blocks.
 /// Handles: text, tool_use (assistant), tool_result (user)
@@ -881,8 +915,19 @@ fn convert_anthropic_messages_to_openai(
                 .and_then(|r| r.as_str())
                 .ok_or_else(|| "Anthropic message is missing role".to_string())?
                 .to_string();
-            if role != "user" && role != "assistant" {
-                return Err("only user and assistant Anthropic messages can be sent to OpenAI Chat Completions".to_string());
+            if role != "user" && role != "assistant" && role != "system" {
+                return Err("only user, assistant, and system Anthropic messages can be sent to OpenAI Chat Completions".to_string());
+            }
+
+            if role == "system" {
+                let content = msg
+                    .get("content")
+                    .ok_or_else(|| "system message is missing content".to_string())?;
+                msgs.push(serde_json::json!({
+                    "role": "system",
+                    "content": anthropic_system_content_to_openai_text(content)?,
+                }));
+                continue;
             }
 
             if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
@@ -916,7 +961,11 @@ fn convert_anthropic_messages_to_openai(
                             if role != "assistant" { return Err("tool_use blocks must be in an assistant message".to_string()); }
                             let id = block.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing id".to_string())?;
                             let name = block.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing name".to_string())?;
-                            let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            let input = block.get("input").ok_or_else(|| "tool_use is missing input".to_string())?;
+                            if !input.is_object() {
+                                return Err("tool_use input must be a JSON object".to_string());
+                            }
+                            let input = input.clone();
                             tool_calls.push(serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": serde_json::to_string(&input).map_err(|e| e.to_string())?}}));
                         }
                         "tool_result" => {
@@ -1044,6 +1093,75 @@ mod anthropic_tests {
         );
         assert_eq!(converted["messages"][2]["role"], "tool");
         assert_eq!(converted["messages"][3]["content"][0]["text"], "thanks");
+    }
+
+    #[test]
+    fn maps_mid_conversation_system_messages_to_chat_system_role() {
+        let request = serde_json::json!({
+            "model": "claude-compatible",
+            "messages": [
+                {"role":"user", "content":"use the strict profile"},
+                {"role":"system", "content":[{"type":"text", "text":"strict profile active", "cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant", "content":[{"type":"text", "text":"ack"}]}
+            ]
+        });
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(converted["messages"][0]["role"], "user");
+        assert_eq!(converted["messages"][1]["role"], "system");
+        assert_eq!(converted["messages"][1]["content"], "strict profile active");
+        assert_eq!(converted["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn legacy_tool_choice_strings_map_or_reject() {
+        for (input, expected) in [("auto", "auto"), ("any", "required")] {
+            let request = serde_json::json!({
+                "model": "model",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": input
+            });
+            let converted = anthropic_to_openai(&request).unwrap();
+            assert_eq!(converted["tool_choice"], expected);
+        }
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "tool"
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "bogus"
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+    }
+
+    #[test]
+    fn legacy_tool_use_requires_input_not_fabricated() {
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run"}]}]
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run", "input":[]}]}]
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run", "input":{}}]}]
+        });
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
     }
 
     #[test]
